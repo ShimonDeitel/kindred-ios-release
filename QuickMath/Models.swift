@@ -1,35 +1,81 @@
-import Foundation
+import SwiftUI
 import SwiftData
 
-// MARK: - SwiftData models
+// MARK: - SwiftData Models
 
-@Model
-final class WaveEntry {
-    var id: UUID
-    var date: Date
-    var level: Int
-    var partOfDay: String
-    var tag: String?
-
-    init(id: UUID = UUID(), date: Date = .now, level: Int, partOfDay: String = "day", tag: String? = nil) {
-        self.id = id
-        self.date = date
-        self.level = level
-        self.partOfDay = partOfDay
-        self.tag = tag
+enum DetailKind: String, Codable, CaseIterable {
+    case loves, dislikes, goal, worry, date
+    var label: String {
+        switch self {
+        case .loves: return "Loves"
+        case .dislikes: return "Dislikes"
+        case .goal: return "Goal"
+        case .worry: return "Worry"
+        case .date: return "Date"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .loves: return "heart"
+        case .dislikes: return "hand.thumbsdown"
+        case .goal: return "target"
+        case .worry: return "exclamationmark.triangle"
+        case .date: return "calendar"
+        }
     }
 }
 
 @Model
-final class TrendCache {
+final class KindredPerson {
     var id: UUID
-    var weekStart: Date
-    var average: Double
+    var name: String
+    var relation: String
+    var createdAt: Date
 
-    init(id: UUID = UUID(), weekStart: Date, average: Double) {
-        self.id = id
-        self.weekStart = weekStart
-        self.average = average
+    @Relationship(deleteRule: .cascade) var details: [KindredDetail] = []
+    @Relationship(deleteRule: .cascade) var followUps: [KindredFollowUp] = []
+
+    init(name: String, relation: String) {
+        self.id = UUID()
+        self.name = name
+        self.relation = relation
+        self.createdAt = Date()
+    }
+}
+
+@Model
+final class KindredDetail {
+    var id: UUID
+    var personID: UUID
+    var kind: String
+    var text: String
+    var addedAt: Date
+
+    var kindEnum: DetailKind { DetailKind(rawValue: kind) ?? .loves }
+
+    init(personID: UUID, kind: DetailKind, text: String) {
+        self.id = UUID()
+        self.personID = personID
+        self.kind = kind.rawValue
+        self.text = text
+        self.addedAt = Date()
+    }
+}
+
+@Model
+final class KindredFollowUp {
+    var id: UUID
+    var personID: UUID
+    var prompt: String
+    var dueDate: Date
+    var done: Bool
+
+    init(personID: UUID, prompt: String, dueDate: Date) {
+        self.id = UUID()
+        self.personID = personID
+        self.prompt = prompt
+        self.dueDate = dueDate
+        self.done = false
     }
 }
 
@@ -40,9 +86,8 @@ final class AppModel: ObservableObject {
     let container: ModelContainer
     weak var store: Store?
 
-    @Published private(set) var recentEntries: [WaveEntry] = []
-    @Published private(set) var todayEntry: WaveEntry? = nil
-    @Published private(set) var allEntries: [WaveEntry] = []
+    @Published private(set) var people: [KindredPerson] = []
+    @Published private(set) var todayCard: (person: KindredPerson, detail: KindredDetail)?
 
     init(container: ModelContainer) {
         self.container = container
@@ -50,9 +95,9 @@ final class AppModel: ObservableObject {
     }
 
     static func makeContainer() -> ModelContainer {
-        let schema = Schema([WaveEntry.self, TrendCache.self])
+        let schema = Schema([KindredPerson.self, KindredDetail.self, KindredFollowUp.self])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
         do {
-            let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
             return try ModelContainer(for: schema, configurations: [config])
         } catch {
             let fallback = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
@@ -62,66 +107,99 @@ final class AppModel: ObservableObject {
 
     func reload() {
         let ctx = container.mainContext
-        let descriptor = FetchDescriptor<WaveEntry>(sortBy: [SortDescriptor(\.date, order: .reverse)])
-        let fetched = (try? ctx.fetch(descriptor)) ?? []
-        allEntries = fetched
-        recentEntries = Array(fetched.prefix(7))
-        todayEntry = fetched.first(where: { Calendar.current.isDateInToday($0.date) })
+        let descriptor = FetchDescriptor<KindredPerson>(sortBy: [SortDescriptor(\.createdAt)])
+        people = (try? ctx.fetch(descriptor)) ?? []
+        pickTodayCard()
     }
 
     func refresh() { reload() }
 
-    // MARK: Log energy level
-    func logEnergy(level: Int, partOfDay: String = "day", tag: String? = nil) {
-        let ctx = container.mainContext
-        // Replace existing today entry if same partOfDay
-        if let existing = allEntries.first(where: {
-            Calendar.current.isDateInToday($0.date) && $0.partOfDay == partOfDay
-        }) {
-            existing.level = level
-            existing.tag = tag
-        } else {
-            let entry = WaveEntry(level: level, partOfDay: partOfDay, tag: tag)
-            ctx.insert(entry)
+    // MARK: - Today Card
+
+    private func pickTodayCard() {
+        let allDetails: [(KindredPerson, KindredDetail)] = people.flatMap { p in
+            p.details.map { (p, $0) }
         }
+        guard !allDetails.isEmpty else { todayCard = nil; return }
+        // Deterministic daily rotation based on day-of-year
+        let dayIndex = Calendar.current.ordinality(of: .day, in: .era, for: Date()) ?? 0
+        let pair = allDetails[dayIndex % allDetails.count]
+        todayCard = pair
+    }
+
+    // MARK: - People CRUD
+
+    func addPerson(name: String, relation: String) {
+        let ctx = container.mainContext
+        let isPro = store?.isPro ?? false
+        guard isPro || people.count < 10 else { return }
+        let p = KindredPerson(name: name, relation: relation)
+        ctx.insert(p)
+        try? ctx.save()
+        reload()
+        Haptics.success()
+    }
+
+    func deletePerson(_ person: KindredPerson) {
+        let ctx = container.mainContext
+        ctx.delete(person)
         try? ctx.save()
         reload()
     }
 
-    // MARK: 7-day rolling average
-    var sevenDayAverage: Double {
-        let relevant = recentEntries.prefix(7)
-        guard !relevant.isEmpty else { return 0 }
-        return Double(relevant.map(\.level).reduce(0, +)) / Double(relevant.count)
+    // MARK: - Details CRUD
+
+    func addDetail(to person: KindredPerson, kind: DetailKind, text: String) {
+        let ctx = container.mainContext
+        let d = KindredDetail(personID: person.id, kind: kind, text: text)
+        person.details.append(d)
+        try? ctx.save()
+        reload()
+        Haptics.tap()
     }
 
-    // MARK: Best time of day (pro)
-    var bestTimeOfDay: String {
-        let mornings = allEntries.filter { $0.partOfDay == "morning" }
-        let evenings = allEntries.filter { $0.partOfDay == "evening" }
-        let morningAvg = mornings.isEmpty ? 0.0 : Double(mornings.map(\.level).reduce(0, +)) / Double(mornings.count)
-        let eveningAvg = evenings.isEmpty ? 0.0 : Double(evenings.map(\.level).reduce(0, +)) / Double(evenings.count)
-        if morningAvg == 0 && eveningAvg == 0 { return "Not enough data" }
-        if morningAvg >= eveningAvg { return "Morning" }
-        return "Evening"
-    }
-
-    // MARK: Current streak
-    var currentStreak: Int {
-        var streak = 0
-        var checkDate = Calendar.current.startOfDay(for: .now)
-        let daySet = Set(allEntries.map { Calendar.current.startOfDay(for: $0.date) })
-        while daySet.contains(checkDate) {
-            streak += 1
-            checkDate = Calendar.current.date(byAdding: .day, value: -1, to: checkDate)!
+    func deleteDetail(_ detail: KindredDetail, from person: KindredPerson) {
+        let ctx = container.mainContext
+        if let idx = person.details.firstIndex(where: { $0.id == detail.id }) {
+            person.details.remove(at: idx)
         }
-        return streak
+        ctx.delete(detail)
+        try? ctx.save()
+        reload()
     }
+
+    // MARK: - Follow-ups CRUD
+
+    func addFollowUp(to person: KindredPerson, prompt: String, dueDate: Date) {
+        let ctx = container.mainContext
+        let f = KindredFollowUp(personID: person.id, prompt: prompt, dueDate: dueDate)
+        person.followUps.append(f)
+        try? ctx.save()
+        reload()
+        Haptics.tap()
+    }
+
+    func markFollowUpDone(_ followUp: KindredFollowUp) {
+        followUp.done = true
+        try? container.mainContext.save()
+        reload()
+    }
+
+    func deleteFollowUp(_ followUp: KindredFollowUp, from person: KindredPerson) {
+        let ctx = container.mainContext
+        if let idx = person.followUps.firstIndex(where: { $0.id == followUp.id }) {
+            person.followUps.remove(at: idx)
+        }
+        ctx.delete(followUp)
+        try? ctx.save()
+        reload()
+    }
+
+    // MARK: - Delete All
 
     func deleteAllData() {
         let ctx = container.mainContext
-        try? ctx.delete(model: WaveEntry.self)
-        try? ctx.delete(model: TrendCache.self)
+        people.forEach { ctx.delete($0) }
         try? ctx.save()
         reload()
     }
